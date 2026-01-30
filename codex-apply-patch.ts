@@ -5,36 +5,36 @@ import { Type } from "@sinclair/typebox";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
-// Enable Codex-style apply_patch semantics for these model IDs.
-// Note: we intentionally do not gate on provider; users may route OpenAI models through proxies.
+/*
+ * Models that should run under the apply_patch-only policy.
+ * We don't gate on provider because the same models may be routed through proxies.
+ */
 const CODEX_MODEL_IDS = new Set(["gpt-5.2", "gpt-5.2-codex"]);
 
-// UI limits (keep tool call rendering fast and avoid flooding the TUI)
+// Tool-call preview limits for the TUI (avoid huge renders for big diffs).
 const PATCH_PREVIEW_MAX_LINES = 16;
 const PATCH_PREVIEW_MAX_CHARS = 4000;
 
-// ---------------------------------------------------------------------------
-// Model gating / tool policy
-// ---------------------------------------------------------------------------
-
+// Decide whether the active model should be forced into apply_patch-only mode.
 function isCodexModel(ctx: ExtensionContext): boolean {
 	const model = ctx.model;
 	if (!model) return false;
 	return CODEX_MODEL_IDS.has(model.id) || model.id.includes("codex");
 }
 
-// ---------------------------------------------------------------------------
-// Tool result details (for streaming progress + final summary)
-// ---------------------------------------------------------------------------
-
+// Types used for tool progress and result reporting in the TUI.
 type ApplyPatchOpType = "create_file" | "update_file" | "delete_file";
 
 interface ApplyPatchOperation {
 	type: ApplyPatchOpType;
 	path: string;
-	/** V4A diff (create_file expects full file content in create mode) */
+	/**
+	 * V4A diff.
+	 * - create_file: full file content (each line starts with '+')
+	 * - update_file: @@ sections with +/-/space lines
+	 */
 	diff?: string;
-	/** Optional rename support (not in OpenAI docs, but supported by codex freeform patches) */
+	/** Optional move target (non-standard, but some Codex outputs include it). */
 	move_path?: string;
 }
 
@@ -46,14 +46,12 @@ type ApplyPatchDetails =
 			results: Array<{ type: ApplyPatchOpType; path: string; status: "completed" | "failed"; output?: string }>;
 	  };
 
+// Emit a progress update (used by the tool renderer).
 function progress(onUpdate: AgentToolUpdateCallback<ApplyPatchDetails> | undefined, message: string): void {
 	onUpdate?.({ content: [{ type: "text", text: message }], details: { stage: "progress", message } });
 }
 
-// ---------------------------------------------------------------------------
-// Patch engine: V4A diff application
-// ---------------------------------------------------------------------------
-
+// Errors thrown by the diff parser/application are surfaced to the model as tool failures.
 class DiffError extends Error {
 	constructor(message: string) {
 		super(message);
@@ -61,14 +59,17 @@ class DiffError extends Error {
 	}
 }
 
+// Normalize line endings to LF so diff parsing is consistent across platforms.
 function normalizeLineEndings(text: string): string {
 	return text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
 }
 
+// Normalize patch paths to POSIX-style and trim whitespace.
 function normalizePatchPath(p: string): string {
 	return p.replace(/\\/g, "/").trim();
 }
 
+// Validate and sanitize a relative path. Rejects absolute paths and traversal.
 function validateRelativePath(p: string): string {
 	const raw = normalizePatchPath(p);
 	if (!raw) throw new DiffError("Invalid path: empty");
@@ -85,6 +86,7 @@ function validateRelativePath(p: string): string {
 	return normalized;
 }
 
+// Resolve a sanitized relative path against cwd and ensure it doesn't escape.
 function toFsPath(cwd: string, rel: string): string {
 	const abs = path.resolve(cwd, rel);
 	const root = path.resolve(cwd) + path.sep;
@@ -94,6 +96,7 @@ function toFsPath(cwd: string, rel: string): string {
 	return abs;
 }
 
+// Cheap existence check used for create/update/delete preconditions.
 async function fileExists(p: string): Promise<boolean> {
 	try {
 		await fs.stat(p);
@@ -103,12 +106,14 @@ async function fileExists(p: string): Promise<boolean> {
 	}
 }
 
+// Parsed diff chunk: where to delete lines and insert new ones.
 interface Chunk {
 	origIndex: number;
 	delLines: string[];
 	insLines: string[];
 }
 
+// Parse a single V4A section into context + chunks, returning the next index.
 function peekNextSection(
 	lines: string[],
 	startIndex: number,
@@ -184,6 +189,7 @@ function peekNextSection(
 	return { context: old, chunks, nextIndex: index, eof: false };
 }
 
+// Find a matching context block in the target file, with fuzzy fallbacks.
 function findContextCore(lines: string[], context: string[], start: number): { index: number; fuzz: number } {
 	if (context.length === 0) return { index: start, fuzz: 0 };
 
@@ -225,6 +231,7 @@ function findContextCore(lines: string[], context: string[], start: number): { i
 	return { index: -1, fuzz: 0 };
 }
 
+// If the section is marked EOF, prefer matching near file end; otherwise match forward.
 function findContext(lines: string[], context: string[], start: number, eof: boolean): { index: number; fuzz: number } {
 	if (eof) {
 		const atEof = findContextCore(lines, context, Math.max(0, lines.length - context.length));
@@ -235,6 +242,8 @@ function findContext(lines: string[], context: string[], start: number, eof: boo
 	return findContextCore(lines, context, start);
 }
 
+// Apply a V4A update diff to existing file content.
+// Returns updated content plus a fuzz score when context matching was inexact.
 function applyV4AUpdate(input: string, diff: string): { output: string; fuzz: number } {
 	// IMPORTANT: do NOT trim() here. V4A diff lines may start with a leading space (context lines).
 	const normalizedDiff = normalizeLineEndings(diff);
@@ -336,6 +345,7 @@ function applyV4AUpdate(input: string, diff: string): { output: string; fuzz: nu
 	return { output: dest.join("\n"), fuzz };
 }
 
+// Apply a V4A create diff (every line starts with '+') and return file content.
 function applyV4ACreate(diff: string): string {
 	const lines = normalizeLineEndings(diff).split("\n");
 	// Drop trailing empty line to avoid an extra empty content line.
@@ -351,6 +361,7 @@ function applyV4ACreate(diff: string): string {
 	return out.join("\n");
 }
 
+// Atomic write using a temp file in the same directory. Best-effort mode preservation.
 async function writeFileAtomic(abs: string, content: string, mode?: number): Promise<void> {
 	const dir = path.dirname(abs);
 	const base = path.basename(abs);
@@ -383,6 +394,7 @@ async function writeFileAtomic(abs: string, content: string, mode?: number): Pro
 	}
 }
 
+// Apply operations sequentially. Each op reports its own success/failure; no rollback.
 async function applyOperations(
 	operations: ApplyPatchOperation[],
 	cwd: string,
@@ -472,10 +484,8 @@ async function applyOperations(
 	return { fuzz: fuzzTotal, results };
 }
 
-// ---------------------------------------------------------------------------
-// UI helpers (for showing live tool args + results)
-// ---------------------------------------------------------------------------
-
+// UI helpers for rendering tool arguments/results without flooding the TUI.
+// Fast line count that scans at most maxScanChars.
 function countNewlines(text: string, maxScanChars = 200_000): number {
 	const s = text.length > maxScanChars ? text.slice(0, maxScanChars) : text;
 	let n = 0;
@@ -485,6 +495,7 @@ function countNewlines(text: string, maxScanChars = 200_000): number {
 	return n;
 }
 
+// Pull unique, validated paths from tool args (for preview display).
 function extractPathsFromOperations(ops: unknown): string[] {
 	if (!Array.isArray(ops)) return [];
 	const out: string[] = [];
@@ -501,6 +512,7 @@ function extractPathsFromOperations(ops: unknown): string[] {
 	return [...new Set(out)].slice(0, 20);
 }
 
+// Create a small, readable diff preview for the TUI (head/tail truncation).
 function makeDiffPreview(diff: string, maxLines = PATCH_PREVIEW_MAX_LINES, maxChars = PATCH_PREVIEW_MAX_CHARS): string {
 	const text = normalizeLineEndings(diff);
 	if (text.length <= maxChars && countNewlines(text, maxChars) + 1 <= maxLines) return text;
@@ -522,6 +534,7 @@ function makeDiffPreview(diff: string, maxLines = PATCH_PREVIEW_MAX_LINES, maxCh
 	return preview;
 }
 
+// Summarize tool args (op count, approx diff bytes, file paths, preview text).
 function summarizeOperationsArgs(args: unknown): { opCount: number; approxBytes: number; paths: string[]; preview?: string } {
 	const ops = (args as { operations?: unknown })?.operations;
 	if (!Array.isArray(ops)) return { opCount: 0, approxBytes: 0, paths: [] };
@@ -542,13 +555,11 @@ function summarizeOperationsArgs(args: unknown): { opCount: number; approxBytes:
 	return { opCount: ops.length, approxBytes: bytes, paths, preview };
 }
 
-// ---------------------------------------------------------------------------
-// Extension
-// ---------------------------------------------------------------------------
-
+// Extension wiring: tool policy, tool registration, and system prompt hook.
 export default function (pi: ExtensionAPI) {
 	let baselineTools: string[] | null = null;
 
+	// Enforce apply_patch-only policy for selected models; hide edit/write to avoid mixed diffs.
 	function applyToolPolicy(ctx: ExtensionContext): void {
 		if (!baselineTools) baselineTools = pi.getActiveTools();
 
