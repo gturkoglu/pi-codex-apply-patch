@@ -102,6 +102,16 @@ Practical takeaway: if your priority is reviewability/reproducibility, forcing a
 
 This is a single-file extension. You typically don't need to build anything; Pi loads the TypeScript directly.
 
+## References
+
+- OpenAI Platform docs (Apply Patch tool): https://platform.openai.com/docs/guides/apply_patch
+- OpenAI Agents SDK (TypeScript) `applyDiff` reference implementation: https://github.com/openai/openai-agents-js/blob/main/packages/agents-core/src/utils/applyDiff.ts
+- OpenAI Agents SDK (Python) `apply_diff` reference implementation: https://github.com/openai/openai-agents-python/blob/main/src/agents/apply_diff.py
+- OpenAI Agents SDK examples:
+  - TypeScript apply patch tool example: https://github.com/openai/openai-agents-js/blob/main/examples/tools/applyPatch.ts
+  - Python apply patch tool example: https://github.com/openai/openai-agents-python/blob/main/examples/tools/apply_patch.py
+- Pi coding-agent extensions docs: https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/extensions.md
+
 ## License
 
 MIT
