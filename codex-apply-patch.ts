@@ -103,12 +103,6 @@ async function fileExists(p: string): Promise<boolean> {
 	}
 }
 
-function isDone(lines: string[], index: number, prefixes?: string[]): boolean {
-	if (index >= lines.length) return true;
-	if (prefixes && prefixes.some((p) => lines[index]!.startsWith(p))) return true;
-	return false;
-}
-
 interface Chunk {
 	origIndex: number;
 	delLines: string[];
@@ -357,14 +351,24 @@ function applyV4ACreate(diff: string): string {
 	return out.join("\n");
 }
 
-async function writeFileAtomic(abs: string, content: string): Promise<void> {
+async function writeFileAtomic(abs: string, content: string, mode?: number): Promise<void> {
 	const dir = path.dirname(abs);
 	const base = path.basename(abs);
 	const tmp = path.join(dir, `.${base}.tmp-${process.pid}-${Math.random().toString(16).slice(2)}`);
+
 	await fs.writeFile(tmp, content, "utf8");
+	if (typeof mode === "number") {
+		try {
+			await fs.chmod(tmp, mode);
+		} catch {
+			// ignore (best effort)
+		}
+	}
+
 	try {
 		await fs.rename(tmp, abs);
 	} catch (err) {
+		// Windows can fail rename() if the target exists.
 		try {
 			await fs.unlink(abs);
 			await fs.rename(tmp, abs);
@@ -386,92 +390,82 @@ async function applyOperations(
 	onProgress?: (message: string) => void,
 ): Promise<{ fuzz: number; results: Array<{ type: ApplyPatchOpType; path: string; status: "completed" | "failed"; output?: string }> }> {
 	const results: Array<{ type: ApplyPatchOpType; path: string; status: "completed" | "failed"; output?: string }> = [];
-
-	onProgress?.(`Staging ${operations.length} operation(s)...`);
-
-	// Validate and build plan first.
 	let fuzzTotal = 0;
 
-	type OpPlan =
-		| { kind: "delete"; type: ApplyPatchOpType; rel: string; abs: string }
-		| { kind: "write"; type: ApplyPatchOpType; rel: string; abs: string; content: string }
-		| {
-				kind: "move";
-				type: ApplyPatchOpType;
-				relFrom: string;
-				absFrom: string;
-				relTo: string;
-				absTo: string;
-				content: string;
-		  };
+	onProgress?.(`Applying ${operations.length} operation(s)...`);
 
-	const plan: OpPlan[] = [];
-
-	for (const op of operations) {
+	for (let i = 0; i < operations.length; i++) {
 		if (signal?.aborted) throw new Error("Aborted");
 
+		const op = operations[i]!;
 		const type = op.type;
-		const rel = validateRelativePath(op.path);
-		const abs = toFsPath(cwd, rel);
 
-		if (type === "delete_file") {
-			plan.push({ kind: "delete", type, rel, abs });
+		let rel: string;
+		let abs: string;
+		try {
+			rel = validateRelativePath(op.path);
+			abs = toFsPath(cwd, rel);
+		} catch (err) {
+			results.push({
+				type,
+				path: typeof op.path === "string" ? op.path : "(invalid)",
+				status: "failed",
+				output: err instanceof Error ? err.message : String(err),
+			});
 			continue;
 		}
 
-		if (type === "create_file") {
-			if (typeof op.diff !== "string") throw new DiffError(`create_file missing diff for ${rel}`);
-			const content = applyV4ACreate(op.diff);
-			plan.push({ kind: "write", type, rel, abs, content });
-			continue;
-		}
+		onProgress?.(`${i + 1}/${operations.length} ${type} ${rel}`);
 
-		// update_file
-		if (typeof op.diff !== "string") throw new DiffError(`update_file missing diff for ${rel}`);
-		if (!(await fileExists(abs))) throw new DiffError(`File not found at path '${rel}'`);
-		const current = await fs.readFile(abs, "utf8");
-		const { output, fuzz } = applyV4AUpdate(current, op.diff);
-		fuzzTotal += fuzz;
+		try {
+			if (type === "create_file") {
+				if (typeof op.diff !== "string") throw new DiffError(`create_file missing diff for ${rel}`);
+				if (await fileExists(abs)) throw new DiffError(`File already exists at path '${rel}'`);
 
-		if (op.move_path) {
-			const relTo = validateRelativePath(op.move_path);
-			const absTo = toFsPath(cwd, relTo);
-			plan.push({ kind: "move", type, relFrom: rel, absFrom: abs, relTo, absTo, content: output });
-		} else {
-			plan.push({ kind: "write", type, rel, abs, content: output });
-		}
-	}
-
-	// Apply: writes first, then deletes. If a write fails mid-way, repo may be partially updated.
-	// For now we prefer deterministic behavior + clear error output to enable model recovery.
-	onProgress?.("Writing files...");
-	for (const op of plan) {
-		if (signal?.aborted) throw new Error("Aborted");
-		if (op.kind === "write") {
-			await fs.mkdir(path.dirname(op.abs), { recursive: true });
-			await writeFileAtomic(op.abs, op.content);
-			results.push({ type: op.type, path: op.rel, status: "completed" });
-		}
-		if (op.kind === "move") {
-			await fs.mkdir(path.dirname(op.absTo), { recursive: true });
-			await writeFileAtomic(op.absTo, op.content);
-			results.push({ type: op.type, path: op.relTo, status: "completed", output: `Moved from ${op.relFrom}` });
-		}
-	}
-
-	onProgress?.("Deleting files...");
-	for (const op of plan) {
-		if (signal?.aborted) throw new Error("Aborted");
-		if (op.kind === "delete") {
-			if (!(await fileExists(op.abs))) {
-				throw new DiffError(`File not found at path '${op.rel}'`);
+				const content = applyV4ACreate(op.diff);
+				await fs.mkdir(path.dirname(abs), { recursive: true });
+				await writeFileAtomic(abs, content);
+				results.push({ type, path: rel, status: "completed" });
+				continue;
 			}
-			await fs.unlink(op.abs);
-			results.push({ type: op.type, path: op.rel, status: "completed" });
-		}
-		if (op.kind === "move") {
-			await fs.unlink(op.absFrom);
-			results.push({ type: op.type, path: op.relFrom, status: "completed", output: `Deleted after move` });
+
+			if (type === "update_file") {
+				if (typeof op.diff !== "string") throw new DiffError(`update_file missing diff for ${rel}`);
+				if (!(await fileExists(abs))) throw new DiffError(`File not found at path '${rel}'`);
+
+				const st = await fs.stat(abs);
+				const current = await fs.readFile(abs, "utf8");
+				const { output, fuzz } = applyV4AUpdate(current, op.diff);
+				fuzzTotal += fuzz;
+
+				if (op.move_path) {
+					const relTo = validateRelativePath(op.move_path);
+					const absTo = toFsPath(cwd, relTo);
+					if (await fileExists(absTo)) throw new DiffError(`Target already exists at path '${relTo}'`);
+
+					await fs.mkdir(path.dirname(absTo), { recursive: true });
+					await writeFileAtomic(absTo, output, st.mode);
+					await fs.unlink(abs);
+					results.push({ type, path: relTo, status: "completed", output: `Moved from ${rel}` });
+				} else {
+					await fs.mkdir(path.dirname(abs), { recursive: true });
+					await writeFileAtomic(abs, output, st.mode);
+					results.push({ type, path: rel, status: "completed" });
+				}
+				continue;
+			}
+
+			// delete_file
+			if (!(await fileExists(abs))) throw new DiffError(`File not found at path '${rel}'`);
+			await fs.unlink(abs);
+			results.push({ type, path: rel, status: "completed" });
+		} catch (err) {
+			results.push({
+				type,
+				path: rel,
+				status: "failed",
+				output: err instanceof Error ? err.message : String(err),
+			});
 		}
 	}
 
