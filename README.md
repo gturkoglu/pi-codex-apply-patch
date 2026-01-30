@@ -13,7 +13,6 @@ This follows the OpenAI Apply Patch / V4A diff flow:
 - Path validation (prevents directory traversal)
 - Atomic writes
 - Streaming progress updates in the Pi TUI
-- A self-test command: **`/codex_patch_selftest`**
 
 ## Install
 
@@ -37,14 +36,6 @@ pi -e /absolute/path/to/codex-apply-patch.ts
 When the active model is `gpt-5.2` or `gpt-5.2-codex`, the extension:
 - enables the `apply_patch` tool
 - disables Pi's built-in `edit`/`write` tools (so the model must use structured patches)
-
-### Self-test
-
-Inside Pi:
-
-```
-/codex_patch_selftest
-```
 
 ## Tool schema
 

@@ -3,7 +3,6 @@ import { Text } from "@mariozechner/pi-tui";
 import { StringEnum } from "@mariozechner/pi-ai";
 import { Type } from "@sinclair/typebox";
 import * as fs from "node:fs/promises";
-import * as os from "node:os";
 import * as path from "node:path";
 
 // Enable Codex-style apply_patch semantics for these model IDs.
@@ -570,90 +569,6 @@ export default function (pi: ExtensionAPI) {
 
 		pi.setActiveTools(baselineTools.filter((t) => t !== "apply_patch"));
 	}
-
-	pi.registerCommand("codex_patch_selftest", {
-		description: "Run self-tests for Codex apply_patch (V4A) tool",
-		handler: async (_args, ctx) => {
-			applyToolPolicy(ctx);
-
-			const modelStr = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "(no model)";
-			const tools = pi.getActiveTools();
-			const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-codex-apply-patch-"));
-
-			const report: string[] = [];
-			report.push(`Model: ${modelStr}`);
-			report.push(`Active tools: ${tools.join(", ") || "(none)"}`);
-			report.push(`Temp dir: ${tmpDir}`);
-			report.push("");
-
-			const assertEqual = (name: string, a: string, b: string) => {
-				if (a !== b) throw new Error(`${name} failed.\nExpected:\n${b}\n\nActual:\n${a}`);
-			};
-
-			try {
-				// update_file (replace b -> B)
-				await fs.writeFile(path.join(tmpDir, "a.txt"), "a\nb\nc\n", "utf8");
-				await applyOperations(
-					[
-						{
-							type: "update_file",
-							path: "a.txt",
-							diff: ["@@", " a", "-b", "+B", " c"].join("\n"),
-						},
-					],
-					tmpDir,
-				);
-				assertEqual("update_file a.txt", await fs.readFile(path.join(tmpDir, "a.txt"), "utf8"), "a\nB\nc\n");
-				report.push("PASS: update_file");
-
-				// create_file
-				await applyOperations(
-					[
-						{
-							type: "create_file",
-							path: "created.txt",
-							diff: ["+hello", "+world"].join("\n"),
-						},
-					],
-					tmpDir,
-				);
-				assertEqual(
-					"create_file created.txt",
-					await fs.readFile(path.join(tmpDir, "created.txt"), "utf8"),
-					"hello\nworld",
-				);
-				report.push("PASS: create_file");
-
-				// delete_file
-				await applyOperations(
-					[
-						{
-							type: "delete_file",
-							path: "created.txt",
-						},
-					],
-					tmpDir,
-				);
-				if (await fileExists(path.join(tmpDir, "created.txt"))) throw new Error("delete_file failed: file still exists");
-				report.push("PASS: delete_file");
-
-				report.push("");
-				report.push("ALL PASSED");
-				if (ctx.hasUI) ctx.ui.notify("codex_patch_selftest: ALL PASSED", "info");
-			} catch (err) {
-				report.push("");
-				report.push("FAILED");
-				report.push(String(err instanceof Error ? err.message : err));
-				if (ctx.hasUI) ctx.ui.notify("codex_patch_selftest: FAILED", "error");
-			}
-
-			if (ctx.hasUI) {
-				await ctx.ui.editor("codex_patch_selftest", report.join("\n"));
-			} else {
-				console.log(report.join("\n"));
-			}
-		},
-	});
 
 	pi.registerTool({
 		name: "apply_patch",
